@@ -1,0 +1,313 @@
+// TinyΦ: Ultra‑lightweight RV32I RISC‑V core
+// 2-stage pipeline: Fetch (F) and Execute (E)
+// - No caches (direct Wishbone accesses)
+// - No branch prediction (always flush on taken branches)
+// - Supports only RV32I base integer instructions (no M, F, C extensions)
+// - x0 hardwired to zero
+
+module tinyφ (
+    input  wire        clk,          // system clock
+    input  wire        rst_n,        // active-low reset
+
+    // Wishbone instruction memory interface (master)
+    output wire [31:0] imem_addr,
+    input  wire [31:0] imem_data,
+    output wire        imem_cyc,
+    input  wire        imem_ack,
+    output wire        imem_stb,
+    output wire        imem_we,
+    output wire [3:0]  imem_sel,     // byte selects
+    output wire [2:0]  imem_cti,     // cycle type
+    output wire [1:0]  imem_bte,     // burst type
+
+    // Wishbone data memory interface (master)
+    output wire [31:0] dmem_addr,
+    output wire [31:0] dmem_data_wr,
+    input  wire [31:0] dmem_data_rd,
+    output wire        dmem_cyc,
+    output wire        dmem_stb,
+    output wire        dmem_we,
+    output wire [3:0]  dmem_sel,
+    input  wire        dmem_ack,
+    output wire [2:0]  dmem_cti,
+    output wire [1:0]  dmem_bte,
+
+    // external interrupt
+    input  wire        irq
+);
+
+    // --------------------------------------------------------------
+    // Pipeline registers
+    // --------------------------------------------------------------
+    reg [31:0] pc_f;       // fetch stage program counter
+    reg [31:0] ir_f;       // fetch stage instruction (from memory)
+    reg        stall_f;    // stall fetch (e.g., waiting for memory)
+
+    // execute stage registers (valid when exec_valid = 1)
+    reg [31:0] pc_e;
+    reg [31:0] ir_e;
+    reg        exec_valid;
+
+    // --------------------------------------------------------------
+    // Wishbone state machines (simple, minimal support)
+    // --------------------------------------------------------------
+    reg [1:0] imem_state;
+    localparam IMEM_IDLE = 0, IMEM_WAIT = 1;
+
+    reg [1:0] dmem_state;
+    localparam DMEM_IDLE = 0, DMEM_WAIT = 1;
+
+    // --------------------------------------------------------------
+    // Interface defaults
+    // --------------------------------------------------------------
+    assign imem_we   = 1'b0;
+    assign imem_sel  = 4'b1111;
+    assign imem_cti  = 3'b000;
+    assign imem_bte  = 2'b00;
+
+    assign dmem_cti  = 3'b000;
+    assign dmem_bte  = 2'b00;
+
+    // --------------------------------------------------------------
+    // Fetch stage
+    // --------------------------------------------------------------
+    wire [31:0] next_pc;
+    wire        branch_taken;
+    wire [31:0] branch_target;
+
+    // Default: increment by 4
+    assign next_pc = pc_f + 32'd4;
+
+    // Override if a branch is taken from execute stage
+    wire [31:0] pc_f_next = branch_taken ? branch_target : next_pc;
+
+    // Instruction memory request
+    assign imem_addr = pc_f;
+    assign imem_cyc  = ~stall_f;
+    assign imem_stb  = ~stall_f;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pc_f    <= 32'h00000000;
+            ir_f    <= 32'h00000000;
+            stall_f <= 1'b0;
+            imem_state <= IMEM_IDLE;
+        end else begin
+            case (imem_state)
+                IMEM_IDLE: begin
+                    if (~stall_f) begin
+                        imem_state <= IMEM_WAIT;
+                        stall_f <= 1'b1;
+                    end
+                end
+                IMEM_WAIT: begin
+                    if (imem_ack) begin
+                        // instruction ready
+                        ir_f <= imem_data;
+                        pc_f <= pc_f_next;
+                        stall_f <= 1'b0;
+                        imem_state <= IMEM_IDLE;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // --------------------------------------------------------------
+    // Execute stage (combinational)
+    // --------------------------------------------------------------
+    // Decode signals
+    wire [6:0] opcode   = ir_e[6:0];
+    wire [2:0] funct3   = ir_e[14:12];
+    wire [6:0] funct7   = ir_e[31:25];
+    wire [4:0] rs1_addr = ir_e[19:15];
+    wire [4:0] rs2_addr = ir_e[24:20];
+    wire [4:0] rd_addr  = ir_e[11:7];
+    wire [31:0] imm_i   = {{20{ir_e[31]}}, ir_e[31:20]};
+    wire [31:0] imm_s   = {{20{ir_e[31]}}, ir_e[31:25], ir_e[11:7]};
+    wire [31:0] imm_b   = {{19{ir_e[31]}}, ir_e[31], ir_e[7], ir_e[30:25], ir_e[11:8], 1'b0};
+    wire [31:0] imm_j   = {{12{ir_e[31]}}, ir_e[19:12], ir_e[20], ir_e[30:21], 1'b0};
+    wire [31:0] imm_u   = {ir_e[31:12], 12'b0};
+
+    wire        is_r_type = (opcode == 7'b0110011);
+    wire        is_i_type = (opcode == 7'b0010011);
+    wire        is_load   = (opcode == 7'b0000011);
+    wire        is_store  = (opcode == 7'b0100011);
+    wire        is_branch = (opcode == 7'b1100011);
+    wire        is_jal    = (opcode == 7'b1101111);
+    wire        is_jalr   = (opcode == 7'b1100111);
+    wire        is_lui    = (opcode == 7'b0110111);
+    wire        is_auipc  = (opcode == 7'b0010111);
+
+    // ALU control
+    wire [3:0] alu_op;
+    always @(*) begin
+        if (is_r_type) begin
+            case ({funct7, funct3})
+                {7'b0000000, 3'b000}: alu_op = 4'b0000; // ADD
+                {7'b0100000, 3'b000}: alu_op = 4'b0001; // SUB
+                {7'b0000000, 3'b111}: alu_op = 4'b0010; // AND
+                {7'b0000000, 3'b110}: alu_op = 4'b0011; // OR
+                {7'b0000000, 3'b100}: alu_op = 4'b0100; // XOR
+                {7'b0000000, 3'b001}: alu_op = 4'b0101; // SLL
+                {7'b0000000, 3'b101}: alu_op = 4'b0110; // SRL
+                {7'b0100000, 3'b101}: alu_op = 4'b0111; // SRA
+                {7'b0000000, 3'b010}: alu_op = 4'b1000; // SLT
+                {7'b0000000, 3'b011}: alu_op = 4'b1001; // SLTU
+                default: alu_op = 4'b0000;
+            endcase
+        end else if (is_i_type || is_load) begin
+            case (funct3)
+                3'b000: alu_op = 4'b0000; // ADDI
+                3'b001: alu_op = 4'b0101; // SLLI
+                3'b010: alu_op = 4'b1000; // SLTI
+                3'b011: alu_op = 4'b1001; // SLTIU
+                3'b100: alu_op = 4'b0100; // XORI
+                3'b101: alu_op = (funct7[0] ? 4'b0111 : 4'b0110); // SRLI / SRAI
+                3'b110: alu_op = 4'b0011; // ORI
+                3'b111: alu_op = 4'b0010; // ANDI
+                default: alu_op = 4'b0000;
+            endcase
+        end else if (is_lui || is_auipc) begin
+            alu_op = 4'b0000; // pass immediate
+        end else begin
+            alu_op = 4'b0000;
+        end
+    end
+
+    // Register file (32 x 32-bit, x0 hardwired to zero)
+    reg [31:0] regs [0:31];
+    integer i;
+    initial begin
+        for (i = 0; i < 32; i = i + 1) regs[i] = 32'b0;
+    end
+
+    wire [31:0] rs1_data = (rs1_addr == 5'b00000) ? 32'b0 : regs[rs1_addr];
+    wire [31:0] rs2_data = (rs2_addr == 5'b00000) ? 32'b0 : regs[rs2_addr];
+
+    // Write to register file (on rising edge if RegWrite active)
+    wire reg_write;
+    wire [31:0] alu_result;
+    wire [31:0] mem_read_data;
+    wire [31:0] writeback_data;
+
+    assign reg_write = (exec_valid && (is_r_type || is_i_type || is_load || is_lui || is_auipc)) &&
+                       (rd_addr != 5'b00000);
+    assign writeback_data = is_load ? mem_read_data : alu_result;
+
+    always @(posedge clk) begin
+        if (reg_write) begin
+            regs[rd_addr] <= writeback_data;
+        end
+    end
+
+    // ALU (combinational)
+    wire [31:0] alu_src_a = (is_auipc) ? pc_e : rs1_data;
+    wire [31:0] alu_src_b = (is_r_type || is_branch) ? rs2_data :
+                            (is_i_type || is_load || is_store) ? imm_i :
+                            (is_lui || is_auipc) ? imm_u :
+                            (is_jal) ? 32'd4 : 32'd0;
+    // ALU implementation
+    reg [31:0] alu_out;
+    always @(*) begin
+        case (alu_op)
+            4'b0000: alu_out = alu_src_a + alu_src_b;        // ADD, ADDI, AUIPC, LUI
+            4'b0001: alu_out = alu_src_a - alu_src_b;        // SUB
+            4'b0010: alu_out = alu_src_a & alu_src_b;        // AND, ANDI
+            4'b0011: alu_out = alu_src_a | alu_src_b;        // OR, ORI
+            4'b0100: alu_out = alu_src_a ^ alu_src_b;        // XOR, XORI
+            4'b0101: alu_out = alu_src_a << alu_src_b[4:0];  // SLL, SLLI
+            4'b0110: alu_out = alu_src_a >> alu_src_b[4:0];  // SRL, SRLI
+            4'b0111: alu_out = ($signed(alu_src_a) >>> alu_src_b[4:0]); // SRA
+            4'b1000: alu_out = ($signed(alu_src_a) < $signed(alu_src_b)) ? 32'd1 : 32'd0; // SLT
+            4'b1001: alu_out = (alu_src_a < alu_src_b) ? 32'd1 : 32'd0; // SLTU
+            default: alu_out = 32'b0;
+        endcase
+    end
+
+    assign alu_result = alu_out;
+
+    // Branch condition
+    wire branch_eq  = (rs1_data == rs2_data);
+    wire branch_lt  = ($signed(rs1_data) < $signed(rs2_data));
+    wire branch_ltu = (rs1_data < rs2_data);
+    reg branch_condition;
+
+    always @(*) begin
+        case (funct3)
+            3'b000: branch_condition = branch_eq;                    // BEQ
+            3'b001: branch_condition = ~branch_eq;                   // BNE
+            3'b100: branch_condition = branch_lt;                    // BLT
+            3'b101: branch_condition = branch_ltu;                   // BLTU
+            3'b110: branch_condition = ~branch_lt;                   // BGE
+            3'b111: branch_condition = ~branch_ltu;                  // BGEU
+            default: branch_condition = 1'b0;
+        endcase
+    end
+
+    wire branch_taken_e = is_branch && branch_condition;
+    wire jump_e = is_jal || is_jalr;
+    wire taken = branch_taken_e || jump_e;
+
+    assign branch_taken = taken & exec_valid;
+    assign branch_target = (is_jal || is_jalr) ?
+                           (is_jalr ? (rs1_data & ~32'd1) + imm_i : pc_e + imm_j) :
+                           pc_e + imm_b;
+
+    // Load/store data memory access (Wishbone)
+    wire dmem_req = (is_load || is_store) && exec_valid;
+    wire dmem_we_local = is_store && exec_valid;
+
+    assign dmem_addr    = alu_result;
+    assign dmem_data_wr = rs2_data;
+    assign dmem_cyc     = dmem_req;
+    assign dmem_stb     = dmem_req;
+    assign dmem_we      = dmem_we_local;
+    assign dmem_sel     = {4{dmem_req}}; // full word access only (simplified)
+
+    // Data memory read data
+    wire [31:0] load_data = dmem_data_rd;
+
+    assign mem_read_data = load_data;
+
+    // Control memory read data
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            dmem_state <= DMEM_IDLE;
+            exec_valid <= 1'b0;
+            pc_e <= 32'b0;
+            ir_e <= 32'b0;
+        end else begin
+            if (~stall_f && exec_valid) begin
+                // currently executing; will be overwritten by new instruction
+                exec_valid <= 1'b0;
+            end
+
+            if (~stall_f && ~exec_valid) begin
+                // fetch new instruction into execute stage
+                pc_e <= pc_f;          // the PC of the fetched instruction
+                ir_e <= ir_f;
+                exec_valid <= 1'b1;
+            end
+
+            // Data memory handshake
+            case (dmem_state)
+                DMEM_IDLE: begin
+                    if (dmem_req && exec_valid) begin
+                        dmem_state <= DMEM_WAIT;
+                    end
+                end
+                DMEM_WAIT: begin
+                    if (dmem_ack) begin
+                        dmem_state <= DMEM_IDLE;
+                        // load result will be used in writeback on next cycle
+                    end
+                end
+            endcase
+        end
+    end
+
+    // Simple interrupt handling (just ignore: external interrupt can be used to trap)
+    // This core ignores irq for minimalism.
+
+endmodule
