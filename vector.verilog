@@ -1,0 +1,222 @@
+// VectorΦ: RISC‑V Vector Coprocessor (RVV 1.0 subset)
+// VLEN=256, ELEN=64, 4 lanes, 32 vector registers.
+module vector_φ (
+    input  wire        clk,           // system clock
+    input  wire        rst_n,         // active‑low reset
+
+    // Host interface (wishbone or custom)
+    input  wire        csr_we,        // write to control register
+    input  wire [9:0]  csr_addr,      // control register address (vstart, vl, vtype, vcsr)
+    input  wire [31:0] csr_wdata,
+    output wire [31:0] csr_rdata,
+
+    // Vector instruction trigger (from host decoder)
+    input  wire        vinst_valid,   // valid vector instruction
+    input  wire [31:0] vinst,         // raw instruction word
+    output wire        vinst_ready,   // vector unit ready for new instruction
+    output wire        vinst_done,    // instruction completed
+    output wire        vinst_exc,     // exception (e.g., illegal)
+
+    // Vector register file read/write (for host load/store)
+    input  wire [4:0]  vreg_rd_addr,
+    output wire [255:0] vreg_rd_data,
+    input  wire        vreg_we,
+    input  wire [4:0]  vreg_wr_addr,
+    input  wire [255:0] vreg_wr_data
+);
+
+    // --------------------------------------------------------------
+    // Vector Control and Status Registers
+    // --------------------------------------------------------------
+    reg [31:0] vtype;      // VType register (vsew, vlmul, etc.)
+    reg [31:0] vl;         // current vector length in elements
+    reg [31:0] vstart;     // starting element index
+    reg [31:0] vcsr;       // vector control/status (rounding modes, vxsat)
+
+    wire [2:0] vsew = vtype[4:2];   // selected element width (0=8,1=16,2=32,3=64)
+    wire [1:0] vlmul = vtype[1:0];   // not used here, fixed to 1 (no LMUL)
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            vtype <= 32'b0;
+            vl    <= 32'b0;
+            vstart<= 32'b0;
+            vcsr  <= 32'b0;
+        end else if (csr_we) begin
+            case (csr_addr)
+                10'd0: vtype <= csr_wdata;
+                10'd1: vl    <= csr_wdata;
+                10'd2: vstart<= csr_wdata;
+                10'd3: vcsr  <= csr_wdata;
+            endcase
+        end
+    end
+
+    assign csr_rdata = (csr_addr == 10'd0) ? vtype :
+                       (csr_addr == 10'd1) ? vl   :
+                       (csr_addr == 10'd2) ? vstart :
+                       (csr_addr == 10'd3) ? vcsr : 32'b0;
+
+    // Decode current vector instruction
+    wire [6:0] opcode = vinst[6:0];
+    wire [2:0] funct3 = vinst[14:12];
+    wire [4:0] vs2    = vinst[24:20];   // source vector register or scalar
+    wire [4:0] vs1    = vinst[19:15];
+    wire [4:0] vd     = vinst[11:7];
+    wire        is_ve  = (opcode == 7'b1010111);   // vector arithmetic
+    wire        is_vlm = (opcode == 7'b0000111);   // load
+    wire        is_vsm = (opcode == 7'b0100111);   // store
+    wire        is_vset= (opcode == 7'b1010111 && funct3 == 3'b111); // vsetvli/vsetvl
+
+    // operation decode for arithmetic
+    wire        op_add = (vinst[14:12] == 3'b000) && !vinst[25];  // vadd.vv
+    wire        op_sub = (vinst[14:12] == 3'b000) &&  vinst[25];  // vsub.vv
+    wire        op_addi= (vinst[14:12] == 3'b011);                // vadd.vi
+    wire        op_subi= (vinst[14:12] == 3'b011) && vinst[25];   // not standard, but we can use vadd with negative immediate
+    wire        op_addx= (vinst[14:12] == 3'b100);                // vadd.vx
+    wire        op_subx= (vinst[14:12] == 3'b100) && vinst[25];   // vsub.vx
+
+    // --------------------------------------------------------------
+    // Vector Register File
+    // --------------------------------------------------------------
+    reg [255:0] vreg [0:31];
+    integer i;
+    initial begin
+        for (i=0; i<32; i=i+1) vreg[i] = 256'b0;
+    end
+
+    always @(posedge clk) begin
+        if (vreg_we) vreg[vreg_wr_addr] <= vreg_wr_data;
+    end
+
+    assign vreg_rd_data = vreg[vreg_rd_addr];
+
+    // Read ports for vector execution (two read ports, one write port)
+    wire [255:0] vs1_data, vs2_data;
+    assign vs1_data = vreg[vs1];
+    assign vs2_data = vreg[vs2];
+
+    // For masked operations, use v0 as mask
+    wire [255:0] v0_data = vreg[0];
+
+    // --------------------------------------------------------------
+    // Execution state machine
+    // --------------------------------------------------------------
+    localparam IDLE = 0, BUSY = 1;
+    reg state;
+    reg [31:0] elem_cnt;        // current element index (0..vl-1)
+    reg [31:0] op_vd, op_vs1, op_vs2;
+    reg [3:0]  op_type;
+
+    assign vinst_ready = (state == IDLE);
+    assign vinst_done  = (state == BUSY && elem_cnt == vl-1);
+    assign vinst_exc   = 1'b0;  // no exception for subset
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE;
+            elem_cnt <= 32'b0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    if (vinst_valid && (is_ve || is_vlm || is_vsm)) begin
+                        state <= BUSY;
+                        elem_cnt <= vstart;
+                        op_vd <= vd;
+                        op_vs1 <= vs1;
+                        op_vs2 <= vs2;
+                        op_type <= {is_vlm, is_vsm, 
+                                    (op_add || op_addi || op_addx) ? 2'b01 :
+                                    (op_sub || op_subi || op_subx) ? 2'b10 : 2'b00};
+                    end else if (is_vset) begin
+                        // vsetvli: vl = min(rs1, vlenb)
+                        // simplified: vl = rs1 (from integer reg file, not implemented here)
+                        // For now, just set vl = 256/64 = 4 (max elements)
+                        vl <= 32'd4;
+                        vtype <= {vinst[31:8], 8'b0}; // not full, placeholder
+                        vstart <= 32'b0;
+                    end
+                end
+                BUSY: begin
+                    if (elem_cnt < vl-1) begin
+                        elem_cnt <= elem_cnt + 1;
+                    end else begin
+                        state <= IDLE;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // --------------------------------------------------------------
+    // Vector ALU (4 lanes, each processes 64 bits)
+    // --------------------------------------------------------------
+    wire [63:0] vs1_lane [0:3];
+    wire [63:0] vs2_lane [0:3];
+    wire [63:0] v0_lane  [0:3];
+    wire [63:0] result_lane [0:3];
+    wire [255:0] vector_result;
+
+    // Extract lanes (little‑endian: lane0 = bits 63:0, lane1 = 127:64, lane2 = 191:128, lane3 = 255:192)
+    assign vs1_lane[0] = vs1_data[63:0];
+    assign vs1_lane[1] = vs1_data[127:64];
+    assign vs1_lane[2] = vs1_data[191:128];
+    assign vs1_lane[3] = vs1_data[255:192];
+    assign vs2_lane[0] = vs2_data[63:0];
+    assign vs2_lane[1] = vs2_data[127:64];
+    assign vs2_lane[2] = vs2_data[191:128];
+    assign vs2_lane[3] = vs2_data[255:192];
+    assign v0_lane[0]  = v0_data[63:0];
+    assign v0_lane[1]  = v0_data[127:64];
+    assign v0_lane[2]  = v0_data[191:128];
+    assign v0_lane[3]  = v0_data[255:192];
+
+    // Process each lane (only when the corresponding mask bit is set)
+    reg [3:0] mask;
+    always @(*) begin
+        // mask is taken from v0's lower bits (for each element, bit 0 of the 64‑bit word)
+        // Simplified: if v0_lane[0] != 0 then masked lane is active
+        mask[0] = (v0_lane[0] != 64'b0);
+        mask[1] = (v0_lane[1] != 64'b0);
+        mask[2] = (v0_lane[2] != 64'b0);
+        mask[3] = (v0_lane[3] != 64'b0);
+    end
+
+    generate
+        genvar lane;
+        for (lane = 0; lane < 4; lane = lane + 1) begin : lane_alu
+            reg [63:0] lane_result;
+            always @(*) begin
+                lane_result = 64'b0;
+                if (state == BUSY && (elem_cnt[lane] || 1)) begin // elem_cnt selects which group? For simplicity, all lanes operate in parallel.
+                    case (op_type[1:0])
+                        2'b01: lane_result = vs1_lane[lane] + vs2_lane[lane];   // vadd
+                        2'b10: lane_result = vs1_lane[lane] - vs2_lane[lane];   // vsub
+                        default: lane_result = 64'b0;
+                    endcase
+                end
+                // Apply mask: if mask bit is 0, result is zero (or merge from destination? here we zero)
+                result_lane[lane] = mask[lane] ? lane_result : 64'b0;
+            end
+        end
+    endgenerate
+
+    // Assemble vector result
+    assign vector_result = {result_lane[3], result_lane[2], result_lane[1], result_lane[0]};
+
+    // Write back to vector register file on completion (at last element)
+    always @(posedge clk) begin
+        if (state == BUSY && (elem_cnt == vl-1)) begin
+            vreg[op_vd] <= vector_result;
+        end
+    end
+
+    // --------------------------------------------------------------
+    // Vector Load/Store Unit (simplified, using external memory)
+    // --------------------------------------------------------------
+    // For brevity, we assume the host core handles memory access.
+    // In a full design, the vector unit would have its own memory port.
+    // Here we just pass through signals to the top-level.
+    // Not implemented in this skeleton.
+
+endmodule
