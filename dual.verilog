@@ -1,0 +1,237 @@
+module dualφ (
+    input  wire        clk,
+    input  wire        rst_n,
+    // Instruction memory interface (AXI‑lite or Wishbone)
+    output wire [63:0] imem_addr,
+    input  wire [31:0] imem_data,   // 2 instructions per cycle? We'll fetch 64-bit aligned pair
+    output wire        imem_req,
+    input  wire        imem_ack,
+    // Data memory interface
+    output wire [63:0] dmem_addr,
+    output wire [63:0] dmem_wdata,
+    input  wire [63:0] dmem_rdata,
+    output wire [7:0]  dmem_sel,
+    output wire        dmem_we,
+    output wire        dmem_req,
+    input  wire        dmem_ack,
+    // Interrupts
+    input  wire        irq
+);
+    // Parameters
+    localparam PHY_REG_WIDTH = 6;   // 64 physical registers
+    localparam ROB_DEPTH = 32;
+    localparam IQ_DEPTH = 16;
+
+    // ------------------------------
+    // Fetch stage (2‑wide)
+    // ------------------------------
+    wire [63:0] pc_f;
+    wire [31:0] instr_f0, instr_f1;   // two instructions
+    wire        valid_f0, valid_f1;
+    wire [63:0] pc_f0, pc_f1;
+    wire        fetch_stall;
+    wire        flush;
+
+    fetch_stage fetch (
+        .clk(clk), .rst_n(rst_n),
+        .pc_next(pc_next),
+        .flush(flush),
+        .stall(fetch_stall),
+        .imem_addr(imem_addr), .imem_data(imem_data),
+        .imem_req(imem_req), .imem_ack(imem_ack),
+        .pc_f0(pc_f0), .instr_f0(instr_f0), .valid_f0(valid_f0),
+        .pc_f1(pc_f1), .instr_f1(instr_f1), .valid_f1(valid_f1)
+    );
+
+    // ------------------------------
+    // Decode & Rename stage
+    // ------------------------------
+    wire [31:0] instr_d0, instr_d1;
+    wire        valid_d0, valid_d1;
+    wire [63:0] pc_d0, pc_d1;
+    // Renamed physical register indices
+    wire [PHY_REG_WIDTH-1:0] prs1_d0, prs2_d0, prd_d0;
+    wire [PHY_REG_WIDTH-1:0] prs1_d1, prs2_d1, prd_d1;
+    wire        rd_valid_d0, rd_valid_d1;
+    wire [3:0]  op_type_d0, op_type_d1;   // ALU, branch, mul, fpu, load, store, etc.
+    wire [31:0] imm_d0, imm_d1;
+    wire        branch_taken_d;
+
+    decode_rename decode_rename (
+        .clk(clk), .rst_n(rst_n),
+        .flush(flush), .stall(stall_decode),
+        .pc_f0(pc_f0), .instr_f0(instr_f0), .valid_f0(valid_f0),
+        .pc_f1(pc_f1), .instr_f1(instr_f1), .valid_f1(valid_f1),
+        .pc_d0(pc_d0), .instr_d0(instr_d0), .valid_d0(valid_d0),
+        .pc_d1(pc_d1), .instr_d1(instr_d1), .valid_d1(valid_d1),
+        .prs1_d0(prs1_d0), .prs2_d0(prs2_d0), .prd_d0(prd_d0), .rd_valid_d0(rd_valid_d0),
+        .prs1_d1(prs1_d1), .prs2_d1(prs2_d1), .prd_d1(prd_d1), .rd_valid_d1(rd_valid_d1),
+        .op_type_d0(op_type_d0), .imm_d0(imm_d0),
+        .op_type_d1(op_type_d1), .imm_d1(imm_d1),
+        .branch_taken(branch_taken_d)
+    );
+
+    // ------------------------------
+    // Issue Queue (IQ)
+    // ------------------------------
+    wire [IQ_DEPTH-1:0] iq_full;
+    wire [PHY_REG_WIDTH-1:0] iq_prs1, iq_prs2;
+    wire [PHY_REG_WIDTH-1:0] iq_prd;
+    wire [3:0] iq_op_type;
+    wire [31:0] iq_imm;
+    wire [63:0] iq_pc;
+    wire        iq_valid;
+
+    wire        issue0_ready, issue1_ready;
+    wire [PHY_REG_WIDTH-1:0] issue0_prs1, issue0_prs2, issue0_prd;
+    wire [3:0] issue0_op_type;
+    wire [31:0] issue0_imm;
+    wire [63:0] issue0_pc;
+    wire [PHY_REG_WIDTH-1:0] issue1_prs1, issue1_prs2, issue1_prd;
+    wire [3:0] issue1_op_type;
+    wire [31:0] issue1_imm;
+    wire [63:0] issue1_pc;
+
+    issue_queue issue_queue (
+        .clk(clk), .rst_n(rst_n),
+        // Dispatch (from decode/rename)
+        .dispatch_valid0(valid_d0 && !stall_decode),
+        .dispatch_pc0(pc_d0), .dispatch_op_type0(op_type_d0), .dispatch_imm0(imm_d0),
+        .dispatch_prs10(prs1_d0), .dispatch_prs20(prs2_d0), .dispatch_prd0(prd_d0), .dispatch_rd_valid0(rd_valid_d0),
+        .dispatch_valid1(valid_d1 && !stall_decode),
+        .dispatch_pc1(pc_d1), .dispatch_op_type1(op_type_d1), .dispatch_imm1(imm_d1),
+        .dispatch_prs11(prs1_d1), .dispatch_prs21(prs2_d1), .dispatch_prd1(prd_d1), .dispatch_rd_valid1(rd_valid_d1),
+        // Issue ports
+        .issue0_ready(issue0_ready), .issue1_ready(issue1_ready),
+        .issue0_pc(issue0_pc), .issue0_op_type(issue0_op_type), .issue0_imm(issue0_imm),
+        .issue0_prs1(issue0_prs1), .issue0_prs2(issue0_prs2), .issue0_prd(issue0_prd),
+        .issue1_pc(issue1_pc), .issue1_op_type(issue1_op_type), .issue1_imm(issue1_imm),
+        .issue1_prs1(issue1_prs1), .issue1_prs2(issue1_prs2), .issue1_prd(issue1_prd),
+        .wakeup_bus(wakeup_bus), .wakeup_count(wakeup_count),   // from completion
+        .stall_decode(stall_decode)
+    );
+
+    // ------------------------------
+    // Physical Register File & Ready Table
+    // ------------------------------
+    wire [63:0] prf_data [0:63];
+    wire [63:0] prs1_data0, prs2_data0, prs1_data1, prs2_data1;
+    wire        prs1_ready0, prs2_ready0, prs1_ready1, prs2_ready1;
+
+    physical_regfile prf (
+        .clk(clk),
+        .read_addr0(issue0_prs1), .read_data0(prs1_data0), .ready0(prs1_ready0),
+        .read_addr1(issue0_prs2), .read_data1(prs2_data0), .ready1(prs2_ready0),
+        .read_addr2(issue1_prs1), .read_data2(prs1_data1), .ready2(prs1_ready1),
+        .read_addr3(issue1_prs2), .read_data3(prs2_data1), .ready3(prs2_ready1),
+        .write_addr(wb_rd), .write_data(wb_result), .write_en(wb_valid && wb_rd != 0)
+    );
+
+    // Issue condition: both ready and functional unit free
+    assign issue0_ready = prs1_ready0 && prs2_ready0 && fu_available(issue0_op_type);
+    assign issue1_ready = prs1_ready1 && prs2_ready1 && fu_available(issue1_op_type);
+
+    // ------------------------------
+    // Functional Units
+    // ------------------------------
+    wire [63:0] alu0_result, alu1_result;
+    wire [63:0] mul_result;
+    wire [63:0] fpu_result;
+    wire [63:0] lsu_result;
+    wire        alu0_done, alu1_done, mul_done, fpu_done, lsu_done;
+
+    // ALU0 (simple ops: add, sub, logical, shift)
+    alu_simple alu0 (
+        .op_type(issue0_op_type), .a(prs1_data0), .b(prs2_data0), .imm(issue0_imm),
+        .result(alu0_result), .done(alu0_done)
+    );
+
+    // ALU1 (simple ops)
+    alu_simple alu1 (
+        .op_type(issue1_op_type), .a(prs1_data1), .b(prs2_data1), .imm(issue1_imm),
+        .result(alu1_result), .done(alu1_done)
+    );
+
+    // Multiply/Divide unit (multi‑cycle)
+    muldiv muldiv_unit (
+        .clk(clk), .rst_n(rst_n),
+        .op_type(issue0_op_type), .a(prs1_data0), .b(prs2_data0),
+        .result(mul_result), .done(mul_done)
+    );
+
+    // Floating‑point unit (multi‑cycle)
+    fpu fpu_unit (
+        .clk(clk), .rst_n(rst_n),
+        .op_type(issue1_op_type), .a(prs1_data1), .b(prs2_data1), .imm(issue1_imm),
+        .result(fpu_result), .done(fpu_done)
+    );
+
+    // Load‑Store Unit
+    lsu lsu_unit (
+        .clk(clk), .rst_n(rst_n),
+        .op_type(issue0_op_type), .addr(prs1_data0 + issue0_imm), .store_data(prs2_data0),
+        .mem_addr(dmem_addr), .mem_wdata(dmem_wdata), .mem_we(dmem_we), .mem_req(dmem_req),
+        .mem_rdata(dmem_rdata), .mem_ack(dmem_ack),
+        .result(lsu_result), .done(lsu_done)
+    );
+
+    // Issue arbitration: choose which instruction goes to which unit
+    // (simplified: always issue0 to ALU0 or LSU, issue1 to ALU1 or FPU)
+    // In a full design, you'd have an issue selector.
+
+    // ------------------------------
+    // Reorder Buffer (ROB)
+    // ------------------------------
+    wire [31:0] rob_head, rob_tail;
+    wire [PHY_REG_WIDTH-1:0] rob_prd;
+    wire [63:0] rob_pc;
+    wire [3:0] rob_op_type;
+    wire        rob_ready;
+    wire        rob_commit_valid;
+    wire [PHY_REG_WIDTH-1:0] rob_commit_prd;
+    wire [63:0] rob_commit_result;
+    wire [63:0] rob_commit_pc;
+    wire        rob_branch_mispredict;
+
+    reorder_buffer rob (
+        .clk(clk), .rst_n(rst_n),
+        // Dispatch (from decode/rename)
+        .dispatch_valid(valid_d && !stall_decode), .dispatch_pc(pc_d0), .dispatch_op_type(op_type_d0),
+        .dispatch_prd(prd_d0), .dispatch_rd_valid(rd_valid_d0),
+        // Completion from functional units
+        .complete_valid(alu0_done | alu1_done | mul_done | fpu_done | lsu_done),
+        .complete_prd(complete_prd), .complete_result(complete_result),
+        .complete_op_type(complete_op_type),
+        // Commit
+        .commit_valid(rob_commit_valid), .commit_prd(rob_commit_prd),
+        .commit_result(rob_commit_result), .commit_pc(rob_commit_pc),
+        .branch_mispredict(rob_branch_mispredict),
+        .flush(flush), .pc_next(pc_next)
+    );
+
+    // ------------------------------
+    // Writeback (to PRF and ROB)
+    // ------------------------------
+    wire [PHY_REG_WIDTH-1:0] wb_rd;
+    wire [63:0] wb_result;
+    wire        wb_valid;
+
+    assign wb_valid = rob_commit_valid;
+    assign wb_rd = rob_commit_prd;
+    assign wb_result = rob_commit_result;
+
+    // Wakeup bus (to issue queue)
+    wire [PHY_REG_WIDTH-1:0] wakeup_bus [0:3]; // from each FU
+    wire [3:0] wakeup_count; // number of active wakeups
+
+    // Assemble wakeup signals from completed FUs
+    // (simplified: only one completion per cycle)
+
+    // ------------------------------
+    // Branch resolution & flush
+    // ------------------------------
+    wire [63:0] pc_next;
+    assign flush = rob_branch_mispredict || (branch_taken_d && !stall_decode);
+    // PC next is either branch target from ROB or pc+4/8
+
+endmodule
